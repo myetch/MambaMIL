@@ -7,6 +7,7 @@ import os
 from utils.file_utils import save_pkl
 from utils.utils import *
 from utils.core_utils import train
+from utils.metrics import SCALARS
 from dataset.dataset_generic import Generic_MIL_Dataset
 
 # pytorch imports
@@ -15,10 +16,18 @@ import pandas as pd
 import numpy as np
 import wandb
 # torch.use_deterministic_algorithms(True)
+def init_wandb(args):
+    # runs of one model (different seeds / folds) share a group, so the groups compare models in the W&B UI
+    group = args.wandb_group or ('{}-{}'.format(args.model_type, args.mambamil_type) if args.model_type == 'mamba_mil'
+                                 else args.model_type)
+    name = args.wandb_name or '{}-{}-s{}'.format(group, args.backbone, args.seed)
+    wandb.init(project=args.wandb_project or args.task, group=group, name=name, job_type='train',
+               tags=[args.model_type, args.backbone, args.task], config=vars(args))
+
+
 def main(args):
 
-    wandb.init(project=args.task)
-    wandb.config.update(args)
+    init_wandb(args)
     # create results directory if necessary
     if not os.path.isdir(args.results_dir):
         os.mkdir(args.results_dir)
@@ -36,6 +45,7 @@ def main(args):
     all_val_auc = []
     all_test_acc = []
     all_val_acc = []
+    all_final = []
     folds = np.arange(start, end)
     for i in folds:
         seed_torch(args.seed)
@@ -47,15 +57,26 @@ def main(args):
             for d in datasets:
                 d.pre_loading()
             
-        results, test_auc, val_auc, test_acc, val_acc  = train(datasets, i, args)
+        results, test_auc, val_auc, test_acc, val_acc, final = train(datasets, i, args)
 
         all_test_auc.append(test_auc)
         all_val_auc.append(val_auc)
         all_test_acc.append(test_acc)
         all_val_acc.append(val_acc)
+        all_final.append(final)
         #write results to pkl
         filename = os.path.join(args.results_dir, 'split_{}_results.pkl'.format(i))
         save_pkl(filename, results)
+
+    # mean (and std over folds) of every metric: the W&B summary of this run, and a csv for offline use
+    for split in ('val', 'test'):
+        for k in SCALARS:
+            values = [f[split]['scalars'][k] for f in all_final]
+            wandb.summary['{}/{}'.format(split, k)] = float(np.nanmean(values))
+            if len(values) > 1:
+                wandb.summary['{}/{}_std'.format(split, k)] = float(np.nanstd(values, ddof=1))
+    pd.DataFrame([dict(fold=int(i), split=split, **f[split]['scalars']) for i, f in zip(folds, all_final)
+                  for split in ('val', 'test')]).to_csv(os.path.join(args.results_dir, 'final_metrics.csv'), index=False)
 
     final_df = pd.DataFrame({'folds': folds, 'test_auc': all_test_auc, 
         'val_auc': all_val_auc, 'test_acc': all_test_acc, 'val_acc' : all_val_acc})
@@ -134,6 +155,9 @@ parser.add_argument('--in_dim', type=int, default=1024)
 
 parser.add_argument('--mambamil_rate',type=int, default=10, help='mambamil_rate')
 parser.add_argument('--mambamil_layer',type=int, default=2, help='mambamil_layer')
+parser.add_argument('--wandb_project', type=str, default=None, help='W&B project (default: the task name)')
+parser.add_argument('--wandb_group', type=str, default=None, help='W&B group (default: the model, e.g. att_mil or mamba_mil-SRMamba)')
+parser.add_argument('--wandb_name', type=str, default=None, help='W&B run name (default: <group>-<backbone>-s<seed>)')
 parser.add_argument('--mambamil_type',type=str, default='SRMamba', choices= ['Mamba', 'BiMamba', 'SRMamba'], help='mambamil_type')
 
 
@@ -200,6 +224,9 @@ elif args.task == 'BRACS':
      
 else:
     raise NotImplementedError
+
+# class names ordered by label index, for the per-class metrics and the confusion matrix
+args.class_names = [name for name, idx in sorted(dataset.label_dict.items(), key=lambda kv: kv[1])]
     
 # if not os.path.isdir(args.results_dir):
     # os.mkdir(args.results_dir)

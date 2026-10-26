@@ -1,6 +1,8 @@
+import json
 import numpy as np
 import torch
 from utils.utils import *
+from utils.metrics import compute_metrics, from_results
 import os
 from dataset.dataset_generic import save_splits
 from sklearn.preprocessing import label_binarize
@@ -171,12 +173,23 @@ def train(datasets, cur, args):
         early_stopping = None
     print('Done!')
 
+    class_names = getattr(args, 'class_names', None) or [str(c) for c in range(args.n_classes)]
+    if wandb.run is not None:
+        # one x-axis per fold, so the curves of several folds do not run into each other
+        wandb.define_metric('fold{}/epoch'.format(cur))
+        wandb.define_metric('fold{}/*'.format(cur), step_metric='fold{}/epoch'.format(cur))
+
     train_loop_func, validate_func = find_func(args.model_type)
     for epoch in range(args.max_epochs):
 
-        train_loop_func(epoch, model, train_loader, optimizer, args.n_classes, writer, loss_fn)
-        stop = validate_func(cur, epoch, model, val_loader, args.n_classes, 
+        train_loss, train_error = train_loop_func(epoch, model, train_loader, optimizer, args.n_classes, writer, loss_fn)
+        stop, val_metrics = validate_func(cur, epoch, model, val_loader, args.n_classes, 
             early_stopping, writer, loss_fn, args.results_dir)
+        if wandb.run is not None:
+            log = {'fold{}/epoch'.format(cur): epoch, 'fold{}/train/loss'.format(cur): train_loss,
+                   'fold{}/train/error'.format(cur): train_error}
+            log.update({'fold{}/val/{}'.format(cur, k): v for k, v in val_metrics.items()})
+            wandb.log(log)
         # earlystop
         if stop: 
             break
@@ -186,11 +199,30 @@ def train(datasets, cur, args):
     else:
         torch.save(model.state_dict(), os.path.join(args.results_dir, "s_{}_checkpoint.pt".format(cur)))
 
-    _, val_error, val_auc, _= summary(model, val_loader, args.n_classes)
+    val_results, val_error, val_auc, _= summary(model, val_loader, args.n_classes)
     print('Val error: {:.4f}, ROC AUC: {:.4f}'.format(val_error, val_auc))
 
     results_dict, test_error, test_auc, acc_logger = summary(model, test_loader, args.n_classes)
     print('Test error: {:.4f}, ROC AUC: {:.4f}'.format(test_error, test_auc))
+
+    # full metric set (acc, balanced acc, F1, ROC AUC, sensitivity, specificity, per class) of the best checkpoint
+    final = {split: compute_metrics(*from_results(res), args.n_classes, class_names)
+             for split, res in (('val', val_results), ('test', results_dict))}
+    for split, m in final.items():
+        print('{}: '.format(split) + ', '.join('{} {:.4f}'.format(k, v) for k, v in m['scalars'].items()))
+    with open(os.path.join(args.results_dir, 'metrics_fold{}.json'.format(cur)), 'w') as f:
+        json.dump(final, f, indent=1)
+    if wandb.run is not None:
+        for split, m in final.items():
+            for k, v in m['scalars'].items():
+                wandb.summary['fold{}/{}/{}'.format(cur, split, k)] = v
+            rows = [[name, c['support'], c['sensitivity'], c['specificity'], c['precision'], c['f1'], c['auc_roc']]
+                    for name, c in m['per_class'].items()]
+            wandb.log({
+                'final/fold{}/{}/per_class'.format(cur, split): wandb.Table(
+                    columns=['class', 'support', 'sensitivity', 'specificity', 'precision', 'f1', 'auc_roc'], data=rows),
+                'final/fold{}/{}/confusion_matrix'.format(cur, split): wandb.plot.confusion_matrix(
+                    y_true=m['labels'], preds=m['preds'], class_names=m['class_names'])})
 
     for i in range(args.n_classes):
         acc, correct, count = acc_logger.get_summary(i)
@@ -205,7 +237,7 @@ def train(datasets, cur, args):
         writer.add_scalar('final/test_error', test_error, 0)
         writer.add_scalar('final/test_auc', test_auc, 0)
         writer.close()
-    return results_dict, test_auc, val_auc, 1-test_error, 1-val_error 
+    return results_dict, test_auc, val_auc, 1-test_error, 1-val_error, final
 
 
 
@@ -254,6 +286,8 @@ def train_loop(epoch, model, loader, optimizer, n_classes, writer = None, loss_f
         writer.add_scalar('train/loss', train_loss, epoch)
         writer.add_scalar('train/error', train_error, epoch)
 
+    return train_loss, train_error
+
    
 def validate(cur, epoch, model, loader, n_classes, early_stopping = None, writer = None, loss_fn = None, results_dir=None):
     device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -296,6 +330,9 @@ def validate(cur, epoch, model, loader, n_classes, early_stopping = None, writer
         auc = roc_auc_score(labels, prob, multi_class='ovr')
     
     
+    val_metrics = compute_metrics(labels, prob, n_classes)['scalars']
+    val_metrics.update({'loss': val_loss, 'error': val_error})
+
     if writer:
         writer.add_scalar('val/loss', val_loss, epoch)
         writer.add_scalar('val/auc', auc, epoch)
@@ -313,9 +350,9 @@ def validate(cur, epoch, model, loader, n_classes, early_stopping = None, writer
         
         if early_stopping.early_stop:
             print("Early stopping")
-            return True
+            return True, val_metrics
 
-    return False
+    return False, val_metrics
 
 
 
